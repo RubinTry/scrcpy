@@ -1,5 +1,8 @@
 package com.genymobile.scrcpy;
 
+import com.genymobile.scrcpy.audio.AudioCaptureException;
+import com.genymobile.scrcpy.util.Ln;
+
 import android.annotation.SuppressLint;
 import android.annotation.TargetApi;
 import android.app.Application;
@@ -39,6 +42,11 @@ public final class Workarounds {
             Field sCurrentActivityThreadField = ACTIVITY_THREAD_CLASS.getDeclaredField("sCurrentActivityThread");
             sCurrentActivityThreadField.setAccessible(true);
             sCurrentActivityThreadField.set(null, ACTIVITY_THREAD);
+
+            // activityThread.mSystemThread = true;
+            Field mSystemThreadField = ACTIVITY_THREAD_CLASS.getDeclaredField("mSystemThread");
+            mSystemThreadField.setAccessible(true);
+            mSystemThreadField.setBoolean(ACTIVITY_THREAD, true);
         } catch (Exception e) {
             throw new AssertionError(e);
         }
@@ -48,49 +56,25 @@ public final class Workarounds {
         // not instantiable
     }
 
-    public static void apply(boolean audio, boolean camera) {
-        boolean mustFillAppInfo = false;
-        boolean mustFillAppContext = false;
-
-        if (Build.BRAND.equalsIgnoreCase("meizu")) {
-            // Workarounds must be applied for Meizu phones:
-            //  - <https://github.com/Genymobile/scrcpy/issues/240>
-            //  - <https://github.com/Genymobile/scrcpy/issues/365>
-            //  - <https://github.com/Genymobile/scrcpy/issues/2656>
-            //
-            // But only apply when strictly necessary, since workarounds can cause other issues:
-            //  - <https://github.com/Genymobile/scrcpy/issues/940>
-            //  - <https://github.com/Genymobile/scrcpy/issues/994>
-            mustFillAppInfo = true;
-        } else if (Build.BRAND.equalsIgnoreCase("honor")) {
-            // More workarounds must be applied for Honor devices:
-            //  - <https://github.com/Genymobile/scrcpy/issues/4015>
-            //
-            // The system context must not be set for all devices, because it would cause other problems:
-            //  - <https://github.com/Genymobile/scrcpy/issues/4015#issuecomment-1595382142>
-            //  - <https://github.com/Genymobile/scrcpy/issues/3805#issuecomment-1596148031>
-            mustFillAppInfo = true;
-            mustFillAppContext = true;
+    public static void apply() {
+        if (Build.VERSION.SDK_INT >= AndroidVersions.API_31_ANDROID_12) {
+            // On some Samsung devices, DisplayManagerGlobal.getDisplayInfoLocked() calls ActivityThread.currentActivityThread().getConfiguration(),
+            // which requires a non-null ConfigurationController.
+            // ConfigurationController was introduced in Android 12, so do not attempt to set it on lower versions.
+            // <https://github.com/Genymobile/scrcpy/issues/4467>
+            // Must be called before fillAppContext() because it is necessary to get a valid system context.
+            fillConfigurationController();
         }
 
-        if (audio && Build.VERSION.SDK_INT == Build.VERSION_CODES.R) {
-            // Before Android 11, audio is not supported.
-            // Since Android 12, we can properly set a context on the AudioRecord.
-            // Only on Android 11 we must fill the application context for the AudioRecord to work.
-            mustFillAppContext = true;
-        }
-
-        if (camera) {
-            mustFillAppInfo = true;
-            mustFillAppContext = true;
-        }
+        // On ONYX devices, fillAppInfo() breaks video mirroring:
+        // <https://github.com/Genymobile/scrcpy/issues/5182>
+        boolean mustFillAppInfo = !Build.BRAND.equalsIgnoreCase("ONYX");
 
         if (mustFillAppInfo) {
-            Workarounds.fillAppInfo();
+            fillAppInfo();
         }
-        if (mustFillAppContext) {
-            Workarounds.fillAppContext();
-        }
+
+        fillAppContext();
     }
 
     @SuppressWarnings("deprecation")
@@ -149,6 +133,25 @@ public final class Workarounds {
         }
     }
 
+    private static void fillConfigurationController() {
+        try {
+            Class<?> configurationControllerClass = Class.forName("android.app.ConfigurationController");
+            Class<?> activityThreadInternalClass = Class.forName("android.app.ActivityThreadInternal");
+
+            // configurationController = new ConfigurationController(ACTIVITY_THREAD);
+            Constructor<?> configurationControllerConstructor = configurationControllerClass.getDeclaredConstructor(activityThreadInternalClass);
+            configurationControllerConstructor.setAccessible(true);
+            Object configurationController = configurationControllerConstructor.newInstance(ACTIVITY_THREAD);
+
+            // ACTIVITY_THREAD.mConfigurationController = configurationController;
+            Field configurationControllerField = ACTIVITY_THREAD_CLASS.getDeclaredField("mConfigurationController");
+            configurationControllerField.setAccessible(true);
+            configurationControllerField.set(ACTIVITY_THREAD, configurationController);
+        } catch (Throwable throwable) {
+            Ln.d("Could not fill configuration: " + throwable.getMessage());
+        }
+    }
+
     static Context getSystemContext() {
         try {
             Method getSystemContextMethod = ACTIVITY_THREAD_CLASS.getDeclaredMethod("getSystemContext");
@@ -160,9 +163,10 @@ public final class Workarounds {
         }
     }
 
-    @TargetApi(Build.VERSION_CODES.R)
+    @TargetApi(AndroidVersions.API_30_ANDROID_11)
     @SuppressLint("WrongConstant,MissingPermission")
-    public static AudioRecord createAudioRecord(int source, int sampleRate, int channelConfig, int channels, int channelMask, int encoding) {
+    public static AudioRecord createAudioRecord(int source, int sampleRate, int channelConfig, int channels, int channelMask, int encoding) throws
+            AudioCaptureException {
         // Vivo (and maybe some other third-party ROMs) modified `AudioRecord`'s constructor, requiring `Context`s from real App environment.
         //
         // This method invokes the `AudioRecord(long nativeRecordInJavaObj)` constructor to create an empty `AudioRecord` instance, then uses
@@ -230,7 +234,7 @@ public final class Workarounds {
             int[] session = new int[]{AudioManager.AUDIO_SESSION_ID_GENERATE};
 
             int initResult;
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            if (Build.VERSION.SDK_INT < AndroidVersions.API_31_ANDROID_12) {
                 // private native final int native_setup(Object audiorecord_this,
                 // Object /*AudioAttributes*/ attributes,
                 // int[] sampleRate, int channelMask, int channelIndexMask, int audioFormat,
@@ -256,16 +260,28 @@ public final class Workarounds {
                     Method getParcelMethod = attributionSourceState.getClass().getDeclaredMethod("getParcel");
                     Parcel attributionSourceParcel = (Parcel) getParcelMethod.invoke(attributionSourceState);
 
-                    // private native int native_setup(Object audiorecordThis,
-                    // Object /*AudioAttributes*/ attributes,
-                    // int[] sampleRate, int channelMask, int channelIndexMask, int audioFormat,
-                    // int buffSizeInBytes, int[] sessionId, @NonNull Parcel attributionSource,
-                    // long nativeRecordInJavaObj, int maxSharedAudioHistoryMs);
-                    Method nativeSetupMethod = AudioRecord.class.getDeclaredMethod("native_setup", Object.class, Object.class, int[].class, int.class,
-                            int.class, int.class, int.class, int[].class, Parcel.class, long.class, int.class);
-                    nativeSetupMethod.setAccessible(true);
-                    initResult = (int) nativeSetupMethod.invoke(audioRecord, new WeakReference<AudioRecord>(audioRecord), attributes, sampleRateArray,
-                            channelMask, channelIndexMask, audioRecord.getAudioFormat(), bufferSizeInBytes, session, attributionSourceParcel, 0L, 0);
+                    if (Build.VERSION.SDK_INT < AndroidVersions.API_34_ANDROID_14) {
+                        // private native int native_setup(Object audiorecordThis,
+                        // Object /*AudioAttributes*/ attributes,
+                        // int[] sampleRate, int channelMask, int channelIndexMask, int audioFormat,
+                        // int buffSizeInBytes, int[] sessionId, @NonNull Parcel attributionSource,
+                        // long nativeRecordInJavaObj, int maxSharedAudioHistoryMs);
+                        Method nativeSetupMethod = AudioRecord.class.getDeclaredMethod("native_setup", Object.class, Object.class, int[].class,
+                                int.class, int.class, int.class, int.class, int[].class, Parcel.class, long.class, int.class);
+                        nativeSetupMethod.setAccessible(true);
+                        initResult = (int) nativeSetupMethod.invoke(audioRecord, new WeakReference<AudioRecord>(audioRecord), attributes,
+                                sampleRateArray, channelMask, channelIndexMask, audioRecord.getAudioFormat(), bufferSizeInBytes, session,
+                                attributionSourceParcel, 0L, 0);
+                    } else {
+                        // Android 14 added a new int parameter "halInputFlags"
+                        // <https://github.com/aosp-mirror/platform_frameworks_base/commit/f6135d75db79b1d48fad3a3b3080d37be20a2313>
+                        Method nativeSetupMethod = AudioRecord.class.getDeclaredMethod("native_setup", Object.class, Object.class, int[].class,
+                                int.class, int.class, int.class, int.class, int[].class, Parcel.class, long.class, int.class, int.class);
+                        nativeSetupMethod.setAccessible(true);
+                        initResult = (int) nativeSetupMethod.invoke(audioRecord, new WeakReference<AudioRecord>(audioRecord), attributes,
+                                sampleRateArray, channelMask, channelIndexMask, audioRecord.getAudioFormat(), bufferSizeInBytes, session,
+                                attributionSourceParcel, 0L, 0, 0);
+                    }
                 }
             }
 
@@ -291,8 +307,8 @@ public final class Workarounds {
 
             return audioRecord;
         } catch (Exception e) {
-            Ln.e("Failed to invoke AudioRecord.<init>.", e);
-            throw new RuntimeException("Cannot create AudioRecord");
+            Ln.e("Cannot create AudioRecord", e);
+            throw new AudioCaptureException();
         }
     }
 }
